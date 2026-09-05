@@ -60,19 +60,23 @@
 // flight, then block for an ack before sending more - which paces us to the real
 // BLE/WiFi rate and prevents the ESP UART-RX overrun that dropped bulk downloads.
 // WINDOW frames must fit the ESP UART RX FIFO + wireless send buffer.
-// Ceiling on un-acked forward frames. On a download the ESP acks steadily so
-// this never bites; it only matters on a bidirectional UPLOAD, where the ESP
-// defers the small acks while forwarding large incoming chunks. A tight value
-// (4) let inflight hit the cap and stall the AT32 past the client timeout, so
-// keep enough headroom to ride out delayed acks. Only ~1 response is ever
-// really in flight during an upload, so this does not risk an ESP overrun.
-#define BWM_FC_WINDOW               16     // max un-acked forward frames in flight
+// Ceiling on un-acked forward frames. This MUST satisfy the invariant above:
+// BWM_FC_WINDOW * BWM_TX_BUFSZ <= ESP UART_RX_BUF_SIZE, with margin for the ESP
+// RX task being blocked in one app_ble_send/app_tcp_server_send when the next
+// frame arrives. A PM5 frame is up to ~4136 B (PM3_CMD_DATA_SIZE=4064 + framing),
+// so with the ESP FIFO at 32768 B: 3 * 4136 = 12.4 KB, comfortably under. The old
+// value 16 (~66 KB) violated the invariant by ~16x and overran the FIFO on any
+// bulk LF download. Only ~1 forward response is ever in flight during an upload,
+// so 3 leaves upload headroom too.
+#define BWM_FC_WINDOW               3      // max un-acked forward frames in flight
 #ifndef BWM_FC_ACK_TIMEOUT_MS
-// Hard cap (ms) on how long a forward write may block the main loop waiting for
-// acks. A spin COUNT was unbounded in wall-clock time and could hang the main
-// loop long enough that the client gives up and the device looks dead (USB still
-// enumerates on interrupts). Time-bounded => the main loop is always serviced.
-#define BWM_FC_ACK_TIMEOUT_MS       50     // safety valve: proceed if acks stall, never hard-hang
+// Cap (ms) on how long a forward write may block waiting for ack credit. This is
+// a dead-link escape, NOT normal pacing: it must exceed the ESP's worst-case
+// per-frame drain time over BLE, or the AT32 "proceeds anyway" while the ESP is
+// merely slow and outruns the FIFO again. 50 ms was far below one BLE frame time
+// and defeated the window entirely; 500 ms lets a real ack arrive so the window
+// actually backpressures, while still bailing out if the ESP is genuinely dead.
+#define BWM_FC_ACK_TIMEOUT_MS       500    // dead-link escape only; pacing rides on real acks
 #endif // safety valve: give up waiting for credit (avoid hard hang)
 
 #define BWM_CRC16_POLY  0x1021
