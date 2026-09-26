@@ -124,6 +124,12 @@ else
     SRC_BWM =
 endif
 
+ifneq (,$(findstring WITH_CEP,$(APP_CFLAGS)))
+    SRC_CEP = pm5_cep.c
+else
+    SRC_CEP =
+endif
+
 # BWM charger (AW32001) + fuel gauge (BQ27427), incl. the optional low-batt beep
 ifneq (,$(findstring WITH_BWM_STATUS,$(APP_CFLAGS))$(findstring WITH_BWM_CHARGERKICK,$(APP_CFLAGS)))
     SRC_BWM_CHARGER = bwm_charger.c
@@ -136,6 +142,13 @@ ifeq ($(PLATFORM),PM5)
     SRC_BUZZER = buzzer.c
 else
     SRC_BUZZER =
+endif
+
+# PM5 low-power idle (core clock scaling + WFI)
+ifeq ($(PLATFORM),PM5)
+    SRC_PM5_POWER = pm5_power.c
+else
+    SRC_PM5_POWER =
 endif
 
 # PM5 antenna-RGB power/battery indicator
@@ -202,8 +215,10 @@ THUMBSRC = start.c \
     $(SRC_SMARTCARD) \
     $(SRC_FPC) \
     $(SRC_BWM) \
+    $(SRC_CEP) \
     $(SRC_BWM_CHARGER) \
     $(SRC_BUZZER) \
+    $(SRC_PM5_POWER) \
     $(SRC_RGB_INDICATOR) \
     $(SRC_HITAG) \
     $(SRC_EM4x50) \
