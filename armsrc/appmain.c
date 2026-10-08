@@ -718,6 +718,17 @@ static void SendStatus(uint32_t wait) {
 #ifdef WITH_ISO14443b
     printHf14bConfig();   // HF 14b config
 #endif
+#ifdef PM5
+    {
+        sys_fault_record_t fr;
+        if (sys_fault_record_get(&fr)) {
+            const char *kind = (fr.vector == 3) ? "HardFault" : (fr.vector == 4) ? "MemManage" :
+                               (fr.vector == 5) ? "BusFault" : (fr.vector == 6) ? "UsageFault" : "fault";
+            Dbprintf("  Last fault.......... " _RED_("%s") " PC=0x%08x LR=0x%08x", kind, fr.pc, fr.lr);
+            Dbprintf("                       CFSR=0x%08x HFSR=0x%08x addr=0x%08x", fr.cfsr, fr.hfsr, fr.addr);
+        }
+    }
+#endif
 #if defined(PM5) && defined(WITH_BWM_STATUS)
     bwm_print_battery_status();
 #endif
@@ -4661,6 +4672,10 @@ void __attribute__((noreturn)) AppMain(void) {
     }
 
     LEDsoff();
+
+#ifdef PM5
+    sys_fault_record_capture();   // fault of the previous run, shown by hw status
+#endif
 
     // Setup FPGA clock & Reset COM
     FpgaSetup24MHzClk();

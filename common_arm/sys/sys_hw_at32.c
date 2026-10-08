@@ -106,45 +106,152 @@ bool system_bpr_chk_clear(void) {
 void NMI_Handler(void) {
 }
 
-/**
-  * @brief  this function handles hard fault exception.
-  * @retval none
-  */
+#ifdef AS_BOOTROM
+// Bootrom: a restart would re-enter the bootrom, keep the plain halt.
 void HardFault_Handler(void) {
-    /* go to infinite loop when hard fault exception occurs */
     while (1) {
     }
 }
 
-/**
-  * @brief  this function handles memory manage exception.
-  * @retval none
-  */
 void MemManage_Handler(void) {
-    /* go to infinite loop when memory manage exception occurs */
     while (1) {
     }
 }
 
-/**
-  * @brief  this function handles bus fault exception.
-  * @retval none
-  */
 void BusFault_Handler(void) {
-    /* go to infinite loop when bus fault exception occurs */
     while (1) {
     }
 }
 
-/**
-  * @brief  this function handles usage fault exception.
-  * @retval none
-  */
 void UsageFault_Handler(void) {
-    /* go to infinite loop when usage fault exception occurs */
     while (1) {
     }
 }
+#else
+
+// Fault record, kept in the battery domain registers dt2..dt7 across the restart.
+// dt7 is written last and holds the tag, so a half-written record is ignored.
+#define SYS_FAULT_TAG       0xFA170000U
+#define SYS_FAULT_TAG_MASK  0xFFFF0000U
+
+static sys_fault_record_t s_fault_rec;
+
+// Reached after the fault handler returned into thread mode.
+static void __NO_RETURN fault_restart(void) {
+    system_simple_reset();
+    while (1) {
+    }
+}
+
+static void at32_bpr_write_fault(uint32_t pc, uint32_t lr, uint32_t cfsr, uint32_t addr, uint32_t hfsr, uint32_t vect) {
+    CRM->apb1en_bit.pwcen = TRUE;
+    PWC->ctrl_bit.bpwen = TRUE;
+    CRM->cfg_bit.ertcdiv = ((CRM_ERTC_CLOCK_HEXT_DIV_20 & 0x1F0) >> 4);
+    CRM->bpdc_bit.ertcsel = (CRM_ERTC_CLOCK_HEXT_DIV_20 & 0xF);
+    CRM->bpdc_bit.ertcen = TRUE;
+
+    ERTC->wp = SYS_SIMPLE_RESET_BPR_UNLOCK_KEY1;
+    ERTC->wp = SYS_SIMPLE_RESET_BPR_UNLOCK_KEY2;
+    ERTC->dt2 = pc;
+    ERTC->dt3 = lr;
+    ERTC->dt4 = cfsr;
+    ERTC->dt5 = addr;
+    ERTC->dt6 = hfsr;
+    ERTC->dt7 = SYS_FAULT_TAG | (vect & 0x1FFU);
+    ERTC->wp = SYS_SIMPLE_RESET_BPR_LOCK_KEY;
+}
+
+void sys_fault_c(uint32_t *frame, uint32_t exc_ret);
+
+// frame: stacked r0-r3,r12,lr,pc,xpsr. exc_ret: EXC_RETURN value.
+// Returning from here resumes at fault_restart() in thread mode.
+void sys_fault_c(uint32_t *frame, uint32_t exc_ret) {
+    uint32_t pc = 0xFFFFFFFFU, lr = 0xFFFFFFFFU;
+    bool frame_ok = ((uint32_t)frame >= 0x20000000U) && ((uint32_t)frame <= 0x200FFFE0U) && (((uint32_t)frame & 3U) == 0);
+    if (frame_ok) {
+        lr = frame[5];
+        pc = frame[6];
+    }
+
+    uint32_t cfsr = SCB->CFSR;
+    uint32_t addr = (cfsr & 0x8000U) ? SCB->BFAR : ((cfsr & 0x80U) ? SCB->MMFAR : 0);
+    uint32_t ipsr;
+    __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+
+    uint32_t hfsr = SCB->HFSR;
+    SCB->CFSR = cfsr;   // write 1 to clear, else stale bits show up in the next record
+    SCB->HFSR = hfsr;
+
+    at32_bpr_write_fault(pc, lr, cfsr, addr, hfsr, ipsr);
+
+    // Can only redirect a thread-mode fault with a usable frame. Anything else
+    // (fault inside an ISR, bad stack) gets a core reset.
+    if (frame_ok && (exc_ret & 0x8U)) {
+        frame[5] = 0;
+        frame[6] = (uint32_t)fault_restart;
+        return;
+    }
+    nvic_system_reset();
+    while (1) {
+    }
+}
+
+// Pick the active stack pointer from EXC_RETURN and call sys_fault_c().
+#define SYS_FAULT_TRAMPOLINE(name) \
+    __asm__(".pushsection .text.sysfault_" #name ",\"ax\",%progbits\n" \
+            ".syntax unified\n" \
+            ".thumb\n" \
+            ".global " #name "\n" \
+            ".type " #name ", %function\n" \
+            ".thumb_func\n" \
+            #name ":\n" \
+            "  tst lr, #4\n" \
+            "  ite eq\n" \
+            "  mrseq r0, msp\n" \
+            "  mrsne r0, psp\n" \
+            "  mov r1, lr\n" \
+            "  push {r4, lr}\n" \
+            "  bl sys_fault_c\n" \
+            "  pop {r4, pc}\n" \
+            ".popsection\n")
+
+SYS_FAULT_TRAMPOLINE(HardFault_Handler);
+SYS_FAULT_TRAMPOLINE(MemManage_Handler);
+SYS_FAULT_TRAMPOLINE(BusFault_Handler);
+SYS_FAULT_TRAMPOLINE(UsageFault_Handler);
+
+// Copy a record left by the previous run and clear it. Call once at startup.
+void sys_fault_record_capture(void) {
+    CRM->apb1en_bit.pwcen = TRUE;
+    PWC->ctrl_bit.bpwen = TRUE;
+    CRM->bpdc_bit.ertcen = TRUE;
+
+    uint32_t tag = ERTC->dt7;
+    if ((tag & SYS_FAULT_TAG_MASK) != SYS_FAULT_TAG) {
+        return;
+    }
+    s_fault_rec.valid = true;
+    s_fault_rec.vector = tag & 0x1FFU;
+    s_fault_rec.pc = ERTC->dt2;
+    s_fault_rec.lr = ERTC->dt3;
+    s_fault_rec.cfsr = ERTC->dt4;
+    s_fault_rec.addr = ERTC->dt5;
+    s_fault_rec.hfsr = ERTC->dt6;
+
+    ERTC->wp = SYS_SIMPLE_RESET_BPR_UNLOCK_KEY1;
+    ERTC->wp = SYS_SIMPLE_RESET_BPR_UNLOCK_KEY2;
+    ERTC->dt7 = 0;
+    ERTC->wp = SYS_SIMPLE_RESET_BPR_LOCK_KEY;
+}
+
+bool sys_fault_record_get(sys_fault_record_t *out) {
+    if (!s_fault_rec.valid) {
+        return false;
+    }
+    *out = s_fault_rec;
+    return true;
+}
+#endif // AS_BOOTROM
 
 /**
   * @brief  this function handles svcall exception.

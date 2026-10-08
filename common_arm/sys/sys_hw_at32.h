@@ -43,6 +43,20 @@ void system_simple_reset(void);
 
 bool system_bpr_chk_clear(void);
 
+// Fault record of the previous run (PM5 app only, not in the bootrom).
+typedef struct {
+    bool valid;
+    uint32_t vector;   // IPSR: 3 HardFault, 4 MemManage, 5 BusFault, 6 UsageFault
+    uint32_t pc;
+    uint32_t lr;
+    uint32_t cfsr;
+    uint32_t addr;     // BFAR or MMFAR, only meaningful if the matching valid bit is set in cfsr
+    uint32_t hfsr;
+} sys_fault_record_t;
+
+void sys_fault_record_capture(void);
+bool sys_fault_record_get(sys_fault_record_t *out);
+
 STATIC_FORCE_INLINE main_chip_type_t GetChipType(void) {
     return MAIN_CHIP_TYPE_AT32;
 }
