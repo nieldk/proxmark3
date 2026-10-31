@@ -635,11 +635,69 @@ static int bwm_read_file(const char *path, uint8_t **data, size_t *len) {
     return PM3_SUCCESS;
 }
 
-static const char *bwm_ver_norm(const char *v) {
-    while ((*v == 'v') || (*v == 'V')) {
-        v++;
+// Split "<tag>-<N>-g<hash>[-dirty]" (git describe). Non-printable bytes are ignored.
+// A bare "<hash>" (no tag) or anything else unparsable returns false.
+static bool bwm_ver_parse(const char *in, char *base, size_t bsz, long *n, char *hash, size_t hsz, bool *dirty) {
+    char v[96];
+    size_t len = 0;
+    for (; *in && (len < sizeof(v) - 1); in++) {
+        if (isgraph((unsigned char)*in)) {
+            v[len++] = *in;
+        }
     }
-    return v;
+    v[len] = 0;
+    *dirty = false;
+    if ((len > 6) && (strcmp(v + len - 6, "-dirty") == 0)) {
+        *dirty = true;
+        v[len - 6] = 0;
+    }
+    char *h = strrchr(v, '-');
+    if ((h == NULL) || (h[1] != 'g')) {
+        return false;
+    }
+    *h = 0;
+    char *c = strrchr(v, '-');
+    if ((c == NULL) || (c[1] == 0)) {
+        return false;
+    }
+    char *end = NULL;
+    *n = strtol(c + 1, &end, 10);
+    if ((end == NULL) || (*end != 0)) {
+        return false;
+    }
+    *c = 0;
+    snprintf(base, bsz, "%s", v);
+    snprintf(hash, hsz, "%s", h + 2);
+    return true;
+}
+
+// Is `rel` a newer build than `cur`? Sets *why for the message.
+// Same tag: higher commit count wins; equal count + equal hash is the same build.
+// Equal count with a different hash (other branch) or an unparsable string cannot be ordered, so flash.
+static bool bwm_ver_newer(const char *cur, const char *rel, const char **why) {
+    char cb[48], rb[48], ch[24], rh[24];
+    long cn, rn;
+    bool cd, rd;
+    if ((bwm_ver_parse(cur, cb, sizeof(cb), &cn, ch, sizeof(ch), &cd) == false) ||
+            (bwm_ver_parse(rel, rb, sizeof(rb), &rn, rh, sizeof(rh), &rd) == false) ||
+            (strcmp(cb, rb) != 0)) {
+        *why = "versions cannot be ordered";
+        return true;
+    }
+    if (rn > cn) {
+        *why = "newer build available";
+        return true;
+    }
+    if (rn < cn) {
+        *why = "BWM runs a newer build";
+        return false;
+    }
+    if (strcmp(ch, rh) == 0) {
+        *why = cd ? "BWM runs a modified build of this commit" : "same build";
+        return cd;
+    }
+    *why = "same commit count, different commit";
+    return true;
 }
 
 // owner/name, GitHub characters only
@@ -707,11 +765,14 @@ static int bwm_fetch_latest(const char *repo, bool force, uint8_t **fw, size_t *
     char cur[64] = {0};
     if (bwm_get_version(cur, sizeof(cur)) == PM3_SUCCESS) {
         PrintAndLogEx(INFO, "Current BWM firmware..... " _YELLOW_("%s"), cur);
-        if ((force == false) && (strcmp(bwm_ver_norm(cur), bwm_ver_norm(tag)) == 0)) {
-            PrintAndLogEx(SUCCESS, "BWM firmware is already up to date (use --force to reflash)");
+        const char *why = "";
+        bool newer = bwm_ver_newer(cur, tag, &why);
+        if ((newer == false) && (force == false)) {
+            PrintAndLogEx(SUCCESS, "Nothing to do: %s (use --force to reflash)", why);
             json_decref(root);
             return PM3_SUCCESS;
         }
+        PrintAndLogEx(INFO, "%s%s", why, force ? " (forced)" : "");
     }
 
     PrintAndLogEx(INFO, "Downloading " _YELLOW_(BWM_REL_ASSET) " ...");
@@ -769,7 +830,8 @@ static int CmdBWMUpgrade(const char *Cmd) {
                   "Reflash the BWM (ESP32) firmware over the BWM link - no header, no soldering.\n"
                   "Requires a BWM that still responds; this updates a wrong-version ESP, it cannot\n"
                   "recover a fully bricked one (that still needs the 5-pin header + esptool).\n"
-                  "--online downloads the latest CI build published on GitHub (needs `curl`).",
+                  "--online downloads the latest CI build published on GitHub (needs `curl`) and\n"
+                  "flashes it only if it is newer than the running BWM firmware.",
                   "hw bwm upgrade -f bwm_esp32.bin\n"
                   "hw bwm upgrade --online\n"
                   "hw bwm upgrade --online --repo myuser/Proxmark5_BWM_esp32");
@@ -779,7 +841,7 @@ static int CmdBWMUpgrade(const char *Cmd) {
         arg_int0(NULL, "delay", "<ms>", "per-chunk delay to pace the slow AT32<->ESP UART (default 20)"),
         arg_lit0(NULL, "online", "fetch and flash the latest RRG build instead of a file"),
         arg_str0(NULL, "repo", "<owner/name>", "with --online: GitHub repo to fetch from (default " BWM_REPO_DEFAULT ")"),
-        arg_lit0(NULL, "force", "with --online: reflash even if already on the latest build"),
+        arg_lit0(NULL, "force", "with --online: flash even if not newer than the running firmware"),
         arg_param_end,
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
