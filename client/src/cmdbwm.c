@@ -571,8 +571,9 @@ static int bwm_get_version(char *out, size_t outlen) {
     return PM3_SUCCESS;
 }
 
-#define BWM_REL_API    "https://api.github.com/repos/nieldk/Proxmark5_BWM_esp32/releases/tags/latest"
-#define BWM_REL_DL     "https://github.com/nieldk/Proxmark5_BWM_esp32/releases/download/"
+#define BWM_REPO_DEFAULT "RfidResearchGroup/Proxmark5_BWM_esp32"
+#define BWM_REL_API_FMT  "https://api.github.com/repos/%s/releases/tags/latest"
+#define BWM_REL_DL_FMT   "https://github.com/%s/releases/download/"
 #define BWM_REL_ASSET  "proxmark5_ble_wifi_module.bin"
 #define BWM_FW_MAX     0x1D0000   // app_a/app_b slot size in partitions.csv
 
@@ -641,16 +642,33 @@ static const char *bwm_ver_norm(const char *v) {
     return v;
 }
 
+// owner/name, GitHub characters only
+static bool bwm_repo_valid(const char *r) {
+    const char *slash = strchr(r, '/');
+    if ((slash == NULL) || (slash == r) || (slash[1] == '\0') || (strchr(slash + 1, '/') != NULL) || (strstr(r, "..") != NULL)) {
+        return false;
+    }
+    for (; *r; r++) {
+        if ((isalnum((unsigned char)*r) == 0) && (strchr("._-/", *r) == NULL)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Fetch the rolling "latest" GitHub release (published by CI) of the RRG BWM repo and return its app image.
 // Returns PM3_SUCCESS with *fw == NULL when the BWM already runs that release.
-static int bwm_fetch_latest(bool force, uint8_t **fw, size_t *fwlen) {
+static int bwm_fetch_latest(const char *repo, bool force, uint8_t **fw, size_t *fwlen) {
+    char api_url[256], dl_prefix[256];
+    snprintf(api_url, sizeof(api_url), BWM_REL_API_FMT, repo);
+    snprintf(dl_prefix, sizeof(dl_prefix), BWM_REL_DL_FMT, repo);
     const char *dir = get_my_user_directory();
     char jpath[FILE_PATH_SIZE], bpath[FILE_PATH_SIZE];
     snprintf(jpath, sizeof(jpath), "%s/.bwm_release.json", (dir != NULL) ? dir : ".");
     snprintf(bpath, sizeof(bpath), "%s/.bwm_online.bin", (dir != NULL) ? dir : ".");
 
-    PrintAndLogEx(INFO, "Querying latest build of " _YELLOW_("RfidResearchGroup/Proxmark5_BWM_esp32") " ...");
-    if (bwm_http_get(BWM_REL_API, jpath, true) != PM3_SUCCESS) {
+    PrintAndLogEx(INFO, "Querying latest build of " _YELLOW_("%s") " ...", repo);
+    if (bwm_http_get(api_url, jpath, true) != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "query failed - is `curl` installed and the network up?");
         remove(jpath);
         return PM3_EFAILED;
@@ -679,7 +697,7 @@ static int bwm_fetch_latest(bool force, uint8_t **fw, size_t *fwlen) {
             break;
         }
     }
-    if ((tag == NULL) || (url == NULL) || (strncmp(url, BWM_REL_DL, strlen(BWM_REL_DL)) != 0) || (strstr(url, "..") != NULL)) {
+    if ((tag == NULL) || (url == NULL) || (strncmp(url, dl_prefix, strlen(dl_prefix)) != 0) || (strstr(url, "..") != NULL)) {
         PrintAndLogEx(FAILED, "latest build has no usable " _YELLOW_(BWM_REL_ASSET) " asset");
         json_decref(root);
         return PM3_EFAILED;
@@ -753,12 +771,14 @@ static int CmdBWMUpgrade(const char *Cmd) {
                   "recover a fully bricked one (that still needs the 5-pin header + esptool).\n"
                   "--online downloads the latest CI build published on GitHub (needs `curl`).",
                   "hw bwm upgrade -f bwm_esp32.bin\n"
-                  "hw bwm upgrade --online");
+                  "hw bwm upgrade --online\n"
+                  "hw bwm upgrade --online --repo myuser/Proxmark5_BWM_esp32");
     void *argtable[] = {
         arg_param_begin,
         arg_str0("f", "file", "<fn>", "ESP32 firmware image (.bin)"),
         arg_int0(NULL, "delay", "<ms>", "per-chunk delay to pace the slow AT32<->ESP UART (default 20)"),
         arg_lit0(NULL, "online", "fetch and flash the latest RRG build instead of a file"),
+        arg_str0(NULL, "repo", "<owner/name>", "with --online: GitHub repo to fetch from (default " BWM_REPO_DEFAULT ")"),
         arg_lit0(NULL, "force", "with --online: reflash even if already on the latest build"),
         arg_param_end,
     };
@@ -768,8 +788,19 @@ static int CmdBWMUpgrade(const char *Cmd) {
     CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)fn, sizeof(fn), &fnlen);
     uint32_t write_delay_ms = (uint32_t)arg_get_int_def(ctx, 2, 20);
     bool online = arg_get_lit(ctx, 3);
-    bool force = arg_get_lit(ctx, 4);
+    int repolen = 0;
+    char repo[96] = {0};
+    CLIParamStrToBuf(arg_get_str(ctx, 4), (uint8_t *)repo, sizeof(repo), &repolen);
+    bool force = arg_get_lit(ctx, 5);
     CLIParserFree(ctx);
+
+    if (repolen == 0) {
+        snprintf(repo, sizeof(repo), "%s", BWM_REPO_DEFAULT);
+    }
+    if (bwm_repo_valid(repo) == false) {
+        PrintAndLogEx(FAILED, "invalid --repo, expected " _YELLOW_("owner/name"));
+        return PM3_EINVARG;
+    }
 
     if ((fnlen == 0) == (online == false)) {
         PrintAndLogEx(FAILED, "give exactly one of " _YELLOW_("-f <file>") " or " _YELLOW_("--online"));
@@ -779,7 +810,7 @@ static int CmdBWMUpgrade(const char *Cmd) {
     uint8_t *fw = NULL;
     size_t fwlen = 0;
     if (online) {
-        int fres = bwm_fetch_latest(force, &fw, &fwlen);
+        int fres = bwm_fetch_latest(repo, force, &fw, &fwlen);
         if ((fres != PM3_SUCCESS) || (fw == NULL)) {
             return fres;
         }
