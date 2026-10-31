@@ -33,6 +33,9 @@
 #include "cmdflashmem.h" // get_signature..
 #include "fileutils.h"   // loadFile_safe
 #include "util_posix.h"
+#include "proxmark3.h"   // get_my_user_directory
+#include "jansson.h"
+#include <mbedtls/sha256.h>
 
 static int CmdBwmAutoOff(const char *Cmd) {
     // Positional sub-action (no dashes): hw bwm autooff [on|off] [--idle <sec>]
@@ -568,17 +571,195 @@ static int bwm_get_version(char *out, size_t outlen) {
     return PM3_SUCCESS;
 }
 
+#define BWM_REL_API    "https://api.github.com/repos/RfidResearchGroup/Proxmark5_BWM_esp32/releases/tags/latest"
+#define BWM_REL_DL     "https://github.com/RfidResearchGroup/Proxmark5_BWM_esp32/releases/download/"
+#define BWM_REL_ASSET  "proxmark5_ble_wifi_module.bin"
+#define BWM_FW_MAX     0x1D0000   // app_a/app_b slot size in partitions.csv
+
+// Only plain path/URL characters reach the curl command line, so nothing can be shell-expanded.
+static bool bwm_shell_safe(const char *s, bool is_url) {
+    for (; *s; s++) {
+        if (isalnum((unsigned char)*s) || strchr("._-/+~:", *s)) {
+            continue;
+        }
+        if (is_url ? (strchr("?=&%", *s) != NULL) : (strchr(" \\", *s) != NULL)) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static int bwm_http_get(const char *url, const char *out, bool api) {
+    if ((bwm_shell_safe(url, true) == false) || (bwm_shell_safe(out, false) == false)) {
+        return PM3_EINVARG;
+    }
+    char cmd[1024];
+    int n = snprintf(cmd, sizeof(cmd),
+                     "curl -fsSL --proto =https --proto-redir =https --max-time 300 %s-o \"%s\" \"%s\"",
+                     api ? "-H \"Accept: application/vnd.github+json\" " : "", out, url);
+    if ((n < 0) || ((size_t)n >= sizeof(cmd))) {
+        return PM3_EINVARG;
+    }
+    return (system(cmd) == 0) ? PM3_SUCCESS : PM3_EFAILED;
+}
+
+static int bwm_read_file(const char *path, uint8_t **data, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return PM3_EFILE;
+    }
+    long sz = -1;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        sz = ftell(f);
+    }
+    rewind(f);
+    if ((sz <= 0) || (sz > BWM_FW_MAX)) {
+        fclose(f);
+        return PM3_EFILE;
+    }
+    uint8_t *b = calloc(1, (size_t)sz);
+    if (b == NULL) {
+        fclose(f);
+        return PM3_EMALLOC;
+    }
+    size_t rd = fread(b, 1, (size_t)sz, f);
+    fclose(f);
+    if (rd != (size_t)sz) {
+        free(b);
+        return PM3_EFILE;
+    }
+    *data = b;
+    *len = (size_t)sz;
+    return PM3_SUCCESS;
+}
+
+static const char *bwm_ver_norm(const char *v) {
+    while ((*v == 'v') || (*v == 'V')) {
+        v++;
+    }
+    return v;
+}
+
+// Fetch the rolling "latest" GitHub release (published by CI) of the RRG BWM repo and return its app image.
+// Returns PM3_SUCCESS with *fw == NULL when the BWM already runs that release.
+static int bwm_fetch_latest(bool force, uint8_t **fw, size_t *fwlen) {
+    const char *dir = get_my_user_directory();
+    char jpath[FILE_PATH_SIZE], bpath[FILE_PATH_SIZE];
+    snprintf(jpath, sizeof(jpath), "%s/.bwm_release.json", (dir != NULL) ? dir : ".");
+    snprintf(bpath, sizeof(bpath), "%s/.bwm_online.bin", (dir != NULL) ? dir : ".");
+
+    PrintAndLogEx(INFO, "Querying latest build of " _YELLOW_("RfidResearchGroup/Proxmark5_BWM_esp32") " ...");
+    if (bwm_http_get(BWM_REL_API, jpath, true) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "query failed - is `curl` installed and the network up?");
+        remove(jpath);
+        return PM3_EFAILED;
+    }
+
+    json_error_t jerr;
+    json_t *root = json_load_file(jpath, 0, &jerr);
+    remove(jpath);
+    if (root == NULL) {
+        PrintAndLogEx(FAILED, "could not parse release info: %s", jerr.text);
+        return PM3_EFAILED;
+    }
+
+    // The rolling "latest" release carries the build version (git describe) in its name.
+    const char *tag = json_string_value(json_object_get(root, "name"));
+    const char *url = NULL, *digest = NULL;
+    json_int_t asset_size = 0;
+    size_t i;
+    json_t *a;
+    json_array_foreach(json_object_get(root, "assets"), i, a) {
+        const char *name = json_string_value(json_object_get(a, "name"));
+        if ((name != NULL) && (strcmp(name, BWM_REL_ASSET) == 0)) {
+            url = json_string_value(json_object_get(a, "browser_download_url"));
+            digest = json_string_value(json_object_get(a, "digest"));
+            asset_size = json_integer_value(json_object_get(a, "size"));
+            break;
+        }
+    }
+    if ((tag == NULL) || (url == NULL) || (strncmp(url, BWM_REL_DL, strlen(BWM_REL_DL)) != 0) || (strstr(url, "..") != NULL)) {
+        PrintAndLogEx(FAILED, "latest build has no usable " _YELLOW_(BWM_REL_ASSET) " asset");
+        json_decref(root);
+        return PM3_EFAILED;
+    }
+    PrintAndLogEx(INFO, "Latest build.............. " _YELLOW_("%s"), tag);
+
+    char cur[64] = {0};
+    if (bwm_get_version(cur, sizeof(cur)) == PM3_SUCCESS) {
+        PrintAndLogEx(INFO, "Current BWM firmware..... " _YELLOW_("%s"), cur);
+        if ((force == false) && (strcmp(bwm_ver_norm(cur), bwm_ver_norm(tag)) == 0)) {
+            PrintAndLogEx(SUCCESS, "BWM firmware is already up to date (use --force to reflash)");
+            json_decref(root);
+            return PM3_SUCCESS;
+        }
+    }
+
+    PrintAndLogEx(INFO, "Downloading " _YELLOW_(BWM_REL_ASSET) " ...");
+    int res = bwm_http_get(url, bpath, false);
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    if (res == PM3_SUCCESS) {
+        res = bwm_read_file(bpath, &buf, &len);
+    }
+    remove(bpath);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "download failed");
+        json_decref(root);
+        return PM3_EFAILED;
+    }
+    if ((asset_size > 0) && ((size_t)asset_size != len)) {
+        PrintAndLogEx(FAILED, "size mismatch: got %zu bytes, release says %lld", len, (long long)asset_size);
+        free(buf);
+        json_decref(root);
+        return PM3_EFAILED;
+    }
+
+    if ((digest != NULL) && (strncmp(digest, "sha256:", 7) == 0)) {
+        uint8_t h[32];
+        char hex[65];
+        mbedtls_sha256_context sctx;
+        mbedtls_sha256_init(&sctx);
+        mbedtls_sha256_starts_ret(&sctx, 0);
+        mbedtls_sha256_update_ret(&sctx, buf, len);
+        mbedtls_sha256_finish_ret(&sctx, h);
+        mbedtls_sha256_free(&sctx);
+        for (int k = 0; k < 32; k++) {
+            snprintf(hex + (2 * k), 3, "%02x", h[k]);
+        }
+        if (strcasecmp(hex, digest + 7) != 0) {
+            PrintAndLogEx(FAILED, "SHA-256 mismatch - refusing to flash");
+            free(buf);
+            json_decref(root);
+            return PM3_EFAILED;
+        }
+        PrintAndLogEx(SUCCESS, "SHA-256 verified");
+    } else {
+        PrintAndLogEx(WARNING, "no SHA-256 digest published - only the image header is checked");
+    }
+
+    json_decref(root);
+    *fw = buf;
+    *fwlen = len;
+    return PM3_SUCCESS;
+}
+
 static int CmdBWMUpgrade(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hw bwm upgrade",
                   "Reflash the BWM (ESP32) firmware over the BWM link - no header, no soldering.\n"
                   "Requires a BWM that still responds; this updates a wrong-version ESP, it cannot\n"
-                  "recover a fully bricked one (that still needs the 5-pin header + esptool).",
-                  "hw bwm upgrade -f bwm_esp32.bin");
+                  "recover a fully bricked one (that still needs the 5-pin header + esptool).\n"
+                  "--online downloads the latest CI build published on GitHub (needs `curl`).",
+                  "hw bwm upgrade -f bwm_esp32.bin\n"
+                  "hw bwm upgrade --online");
     void *argtable[] = {
         arg_param_begin,
-        arg_str1("f", "file", "<fn>", "ESP32 firmware image (.bin)"),
+        arg_str0("f", "file", "<fn>", "ESP32 firmware image (.bin)"),
         arg_int0(NULL, "delay", "<ms>", "per-chunk delay to pace the slow AT32<->ESP UART (default 20)"),
+        arg_lit0(NULL, "online", "fetch and flash the latest RRG build instead of a file"),
+        arg_lit0(NULL, "force", "with --online: reflash even if already on the latest build"),
         arg_param_end,
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -586,16 +767,23 @@ static int CmdBWMUpgrade(const char *Cmd) {
     char fn[FILE_PATH_SIZE] = {0};
     CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)fn, sizeof(fn), &fnlen);
     uint32_t write_delay_ms = (uint32_t)arg_get_int_def(ctx, 2, 20);
+    bool online = arg_get_lit(ctx, 3);
+    bool force = arg_get_lit(ctx, 4);
     CLIParserFree(ctx);
 
-    if (fnlen == 0) {
-        PrintAndLogEx(FAILED, "no filename given");
+    if ((fnlen == 0) == (online == false)) {
+        PrintAndLogEx(FAILED, "give exactly one of " _YELLOW_("-f <file>") " or " _YELLOW_("--online"));
         return PM3_EINVARG;
     }
 
     uint8_t *fw = NULL;
     size_t fwlen = 0;
-    if ((loadFile_safe(fn, "", (void **)&fw, &fwlen) != PM3_SUCCESS) || (fwlen == 0)) {
+    if (online) {
+        int fres = bwm_fetch_latest(force, &fw, &fwlen);
+        if ((fres != PM3_SUCCESS) || (fw == NULL)) {
+            return fres;
+        }
+    } else if ((loadFile_safe(fn, "", (void **)&fw, &fwlen) != PM3_SUCCESS) || (fwlen == 0)) {
         PrintAndLogEx(FAILED, "could not read " _YELLOW_("%s"), fn);
         return PM3_EFILE;
     }
