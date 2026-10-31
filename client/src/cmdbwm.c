@@ -571,8 +571,8 @@ static int bwm_get_version(char *out, size_t outlen) {
     return PM3_SUCCESS;
 }
 
-#define BWM_REL_API    "https://api.github.com/repos/RfidResearchGroup/Proxmark5_BWM_esp32/releases/tags/latest"
-#define BWM_REL_DL     "https://github.com/RfidResearchGroup/Proxmark5_BWM_esp32/releases/download/"
+#define BWM_REL_API    "https://api.github.com/repos/nieldk/Proxmark5_BWM_esp32/releases/tags/latest"
+#define BWM_REL_DL     "https://github.com/nieldk/Proxmark5_BWM_esp32/releases/download/"
 #define BWM_REL_ASSET  "proxmark5_ble_wifi_module.bin"
 #define BWM_FW_MAX     0x1D0000   // app_a/app_b slot size in partitions.csv
 
