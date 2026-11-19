@@ -21,6 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <inttypes.h>
 
 #include "cmdparser.h" // command_t
 #include "cliparser.h"
@@ -391,7 +392,280 @@ static int CmdBWMWifi(const char *Cmd) {
 
 static int bwm_zbprobe_print_one(void);
 static int bwm_zbprobe_get_one(bwm_zbprobe_regs_t *out);
-static int bwm_zbprobe_run_watch(int zbchan, uint32_t aa, uint16_t duration_s, bool do_watch, FILE *logf);
+static int bwm_zbprobe_run_watch(int zbchan, uint32_t aa, uint16_t duration_s, bool do_watch, bool raw, FILE *logf);
+static void bwm_zb_describe_frame(const uint8_t *f, int flen, char *out, size_t outsz);
+
+// IEEE 802.15.4 MAC header, decoded. Port of zb_parse.py's parse_mac() from
+// the ChameleonUltra (Phreakbyte) fork, which has a real 802.15.4 radio and
+// hands up clean MPDUs - ported here as-is, since the MAC/NWK layout is the
+// same regardless of how the PHY bits were captured. Whether byte 0 of
+// rxbuf_snapshot actually lines up with this header is unconfirmed; mis-
+// aligned/garbage input is expected to come out as "ok=false", not garbage
+// fields - same "report unparsed, don't guess" rule as the Python original.
+typedef struct {
+    uint8_t type;
+    bool security, ack_req, panid_comp, seq_suppr, ie;
+    uint8_t dst_mode, version, src_mode;
+    bool have_seq;
+    uint8_t seq;
+    bool have_dst;
+    uint16_t dst_pan;
+    uint64_t dst;
+    bool have_src;
+    uint16_t src_pan;
+    uint64_t src;
+    int payload_off;
+    bool ok;
+} bwm_zb_mac_t;
+
+// mode 2 = short (2 bytes), 3 = extended (8 bytes). Returns false on short buffer.
+static bool bwm_zb_addr(const uint8_t *f, int flen, int off, uint8_t mode, uint64_t *val, int *new_off) {
+    int n = (mode == 2) ? 2 : 8;
+    if (off + n > flen) {
+        return false;
+    }
+    uint64_t v = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        v = (v << 8) | f[off + i];
+    }
+    *val = v;
+    *new_off = off + n;
+    return true;
+}
+
+static bool bwm_zb_parse_mac(const uint8_t *f, int flen, bwm_zb_mac_t *m) {
+    memset(m, 0, sizeof(*m));
+    if (flen < 2) {
+        return false;
+    }
+    uint16_t fcf = f[0] | (f[1] << 8);
+    m->type = fcf & 7;
+    m->security   = (fcf & 0x8) != 0;
+    m->ack_req    = (fcf & 0x20) != 0;
+    m->panid_comp = (fcf & 0x40) != 0;
+    m->seq_suppr  = (fcf & 0x100) != 0;
+    m->ie         = (fcf & 0x200) != 0;
+    m->dst_mode = (fcf >> 10) & 3;
+    m->version  = (fcf >> 12) & 3;
+    m->src_mode = (fcf >> 14) & 3;
+
+    int off = 2;
+    if (!m->seq_suppr) {
+        if (flen < 3) {
+            return true;    // short, but not "unparsed" - mirrors zb_parse.py
+        }
+        m->seq = f[2];
+        m->have_seq = true;
+        off = 3;
+    }
+    if (m->dst_mode == 1 || m->src_mode == 1) {
+        return true;        // reserved address mode
+    }
+    if (m->dst_mode) {
+        if (off + 2 > flen) {
+            return true;
+        }
+        m->dst_pan = f[off] | (f[off + 1] << 8);
+        off += 2;
+        int off2;
+        if (!bwm_zb_addr(f, flen, off, m->dst_mode, &m->dst, &off2)) {
+            return true;
+        }
+        m->have_dst = true;
+        off = off2;
+    }
+    if (m->src_mode) {
+        if (m->panid_comp && m->dst_mode) {
+            m->src_pan = m->dst_pan;
+        } else {
+            if (off + 2 > flen) {
+                return true;
+            }
+            m->src_pan = f[off] | (f[off + 1] << 8);
+            off += 2;
+        }
+        int off2;
+        if (!bwm_zb_addr(f, flen, off, m->src_mode, &m->src, &off2)) {
+            return true;
+        }
+        m->have_src = true;
+        off = off2;
+    }
+    m->payload_off = off;
+    m->ok = true;
+    return true;
+}
+
+// Zigbee beacon payload (15 bytes), only for plain beacons: no GTS, no pending addresses.
+typedef struct {
+    bool coordinator, permit_join, router_cap, ed_cap;
+    uint8_t stack_profile, nwk_ver, depth, nwk_update_id;
+    uint64_t epid;
+} bwm_zb_beacon_t;
+
+static bool bwm_zb_parse_beacon(const uint8_t *f, int flen, const bwm_zb_mac_t *m, bwm_zb_beacon_t *b) {
+    if (!m->ok || m->type != 0 || m->security || m->ie) {
+        return false;
+    }
+    int o = m->payload_off;
+    if (o + 4 > flen) {
+        return false;
+    }
+    uint16_t sf = f[o] | (f[o + 1] << 8);
+    uint8_t gts = f[o + 2], pend = f[o + 3];
+    if ((gts & 7) || pend) {
+        return false;      // GTS descriptors / pending addresses present
+    }
+    const uint8_t *p = f + o + 4;
+    int plen = flen - (o + 4);
+    if (plen < 15 || p[0] != 0) {
+        return false;
+    }
+    memset(b, 0, sizeof(*b));
+    b->coordinator = (sf & 0x4000) != 0;
+    b->permit_join = (sf & 0x8000) != 0;
+    b->stack_profile = p[1] & 0xF;
+    b->nwk_ver = p[1] >> 4;
+    b->router_cap = (p[2] & 4) != 0;
+    b->depth = (p[2] >> 3) & 0xF;
+    b->ed_cap = (p[2] & 0x80) != 0;
+    uint64_t epid = 0;
+    for (int i = 7; i >= 0; i--) {
+        epid = (epid << 8) | p[3 + i];
+    }
+    b->epid = epid;
+    b->nwk_update_id = p[14];
+    return true;
+}
+
+// Zigbee NWK header of a data frame (MAC payload). Unsecured MAC frames only.
+typedef struct {
+    uint8_t ftype, proto, radius, seq;
+    bool security;
+    uint16_t dst, src;
+    bool have_dst_ieee, have_src_ieee;
+    uint64_t dst_ieee, src_ieee;
+} bwm_zb_nwk_t;
+
+static bool bwm_zb_parse_nwk(const uint8_t *f, int flen, const bwm_zb_mac_t *m, bwm_zb_nwk_t *n) {
+    if (!m->ok || m->type != 1 || m->security) {
+        return false;
+    }
+    const uint8_t *p = f + m->payload_off;
+    int plen = flen - m->payload_off;
+    if (plen < 8) {
+        return false;
+    }
+    memset(n, 0, sizeof(*n));
+    uint16_t fcf = p[0] | (p[1] << 8);
+    n->ftype = fcf & 3;
+    n->proto = (fcf >> 2) & 0xF;
+    n->security = (fcf & 0x200) != 0;
+    n->dst = p[2] | (p[3] << 8);
+    n->src = p[4] | (p[5] << 8);
+    n->radius = p[6];
+    n->seq = p[7];
+    int o = 8;
+    if (fcf & 0x800) {
+        if (o + 8 > plen) {
+            return true;
+        }
+        uint64_t v = 0;
+        for (int i = 7; i >= 0; i--) {
+            v = (v << 8) | p[o + i];
+        }
+        n->dst_ieee = v;
+        n->have_dst_ieee = true;
+        o += 8;
+    }
+    if (fcf & 0x1000) {
+        if (o + 8 > plen) {
+            return true;
+        }
+        uint64_t v = 0;
+        for (int i = 7; i >= 0; i--) {
+            v = (v << 8) | p[o + i];
+        }
+        n->src_ieee = v;
+        n->have_src_ieee = true;
+    }
+    // source route / multicast header not walked (not needed for the probe display).
+    return true;
+}
+
+// Small built-in fallback (same entries as zb_parse.py's OUI_VENDORS); the
+// fork's full IEEE OUI registry (oui_vendors.tsv, ~1.2MB) isn't worth
+// embedding in the client for this probe display.
+static const struct { uint32_t oui; const char *name; } g_zb_oui_fallback[] = {
+    {0x000D6F, "Ember/Silicon Labs"},
+    {0x00124B, "Texas Instruments"},
+    {0x0013A2, "MaxStream/Digi (XBee)"},
+    {0x00158D, "Jennic/NXP"},
+    {0xC09B9E, "Silicon Labs"},
+};
+
+static const char *bwm_zb_oui_vendor(uint64_t eui64) {
+    uint32_t oui = (uint32_t)((eui64 >> 40) & 0xFFFFFF);
+    for (size_t i = 0; i < ARRAYLEN(g_zb_oui_fallback); i++) {
+        if (g_zb_oui_fallback[i].oui == oui) {
+            return g_zb_oui_fallback[i].name;
+        }
+    }
+    return NULL;
+}
+
+// One-line decode, same shape as zb_parse.py's describe_frame(): type,
+// addressing, and beacon/NWK summary where parseable.
+static void bwm_zb_describe_frame(const uint8_t *f, int flen, char *out, size_t outsz) {
+    static const char *frame_types[] = {"beacon", "data", "ack", "command"};
+    bwm_zb_mac_t m;
+    if (!bwm_zb_parse_mac(f, flen, &m) || flen < 2) {
+        snprintf(out, outsz, "short: %s", sprint_hex_inrow(f, (size_t)flen));
+        return;
+    }
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "%s", frame_types[m.type]);
+    if (!m.ok) {
+        snprintf(buf + n, sizeof(buf) - n, " (header not parsed)");
+        snprintf(out, outsz, "%s", buf);
+        return;
+    }
+    if (m.have_seq) {
+        n += snprintf(buf + n, sizeof(buf) - n, " seq=%u", m.seq);
+    }
+    if (m.have_dst) {
+        n += snprintf(buf + n, sizeof(buf) - n, " dst=0x%04x:0x%" PRIx64, m.dst_pan, m.dst);
+    }
+    if (m.have_src) {
+        n += snprintf(buf + n, sizeof(buf) - n, " src=0x%04x:0x%" PRIx64, m.src_pan, m.src);
+    }
+    if (m.security) {
+        n += snprintf(buf + n, sizeof(buf) - n, " [mac-secured]");
+    }
+    bwm_zb_beacon_t b;
+    bwm_zb_nwk_t nwk;
+    if (bwm_zb_parse_beacon(f, flen, &m, &b)) {
+        n += snprintf(buf + n, sizeof(buf) - n, " EPID=%016" PRIx64 " profile=%u depth=%u join=%c",
+                      b.epid, b.stack_profile, b.depth, b.permit_join ? 'y' : 'n');
+    } else if (bwm_zb_parse_nwk(f, flen, &m, &nwk)) {
+        static const char *nwk_ftypes[] = {"data", "cmd", "?", "interpan"};
+        n += snprintf(buf + n, sizeof(buf) - n, " nwk[%s 0x%04x->0x%04x r=%u s=%u%s]",
+                      nwk_ftypes[nwk.ftype], nwk.src, nwk.dst, nwk.radius, nwk.seq,
+                      nwk.security ? " nwk-secured" : "");
+        if (nwk.have_src_ieee) {
+            const char *v = bwm_zb_oui_vendor(nwk.src_ieee);
+            n += snprintf(buf + n, sizeof(buf) - n, " src-ieee=%016" PRIx64 "%s%s%s",
+                          nwk.src_ieee, v ? " (" : "", v ? v : "", v ? ")" : "");
+        }
+        if (nwk.have_dst_ieee) {
+            const char *v = bwm_zb_oui_vendor(nwk.dst_ieee);
+            n += snprintf(buf + n, sizeof(buf) - n, " dst-ieee=%016" PRIx64 "%s%s%s",
+                          nwk.dst_ieee, v ? " (" : "", v ? v : "", v ? ")" : "");
+        }
+    }
+    (void)n;
+    snprintf(out, outsz, "%s", buf);
+}
 
 // Only every other 802.15.4 channel's center frequency falls on BLE's 2MHz
 // grid (2402 + 2*k MHz). Returns the BLE channel index 0-39, or -1 if
@@ -421,18 +695,21 @@ static int CmdBWMZbProbe(const char *Cmd) {
     CLIParserInit(&ctx, "hw bwm zbprobe",
                   "EXPERIMENTAL. Test whether the BWM's ESP32-C2 BLE controller can be\n"
                   "driven into a raw 802.15.4-style receive (2M GFSK, custom access\n"
-                  "address, whitening off). Does NOT decode Zigbee frames yet - this\n"
-                  "only reports whether the chip survives, its PHY registers, and a\n"
-                  "candidate RX buffer read. Takes the BWM's BLE controller away from\n"
-                  "BLE SPP while running; use the BWM over USB/UART, not BLE, while\n"
-                  "testing this.\n"
+                  "address, whitening off). Whether rxbuf_snapshot actually lines up\n"
+                  "with an IEEE 802.15.4 MAC header is NOT confirmed on this chip -\n"
+                  "each snapshot is run through the same MAC/NWK/beacon parser as the\n"
+                  "ChameleonUltra fork's zb_parse.py; unparseable bytes are reported as\n"
+                  "such, not guessed. Use --raw for the old plain hex dump instead.\n"
+                  "Takes the BWM's BLE controller away from BLE SPP while running; use\n"
+                  "the BWM over USB/UART, not BLE, while testing this.\n"
                   "--zbchan is a real 802.15.4 channel number (11-26) - the frequency is\n"
                   "set exactly via BLE's own public channel plan, no guesswork, but only\n"
                   "every other 802.15.4 channel lines up with a BLE channel: 12, 14, 16,\n"
                   "18, 20, 22, 24, 26. --watch only prints when rxbuf_snapshot actually\n"
                   "changes, plus a summary at the end - not one line per poll.",
                   "hw bwm zbprobe --start --zbchan 20                    --> probe ch 20 (2450MHz) for 60s\n"
-                  "hw bwm zbprobe --start --zbchan 20 --duration 300 --watch --> probe + live snapshots for 5min\n"
+                  "hw bwm zbprobe --start --zbchan 20 --duration 300 --watch --> probe + live parsed frames for 5min\n"
+                  "hw bwm zbprobe --start --zbchan 20 --watch --raw          --> same, but plain hex instead of parsed\n"
                   "hw bwm zbprobe --start --zbchan 20 --watch --log zb20.csv --> same, plus a CSV log to correlate later\n"
                   "hw bwm zbprobe --sweep --duration 30                  --> 30s on each of the 8 valid channels\n"
                   "hw bwm zbprobe --status                               --> one register snapshot\n"
@@ -445,6 +722,7 @@ static int CmdBWMZbProbe(const char *Cmd) {
         arg_lit0(NULL, "status", "one register snapshot"),
         arg_lit0(NULL, "sweep", "cycle through all 8 valid channels, --duration seconds each (implies --watch)"),
         arg_lit0(NULL, "watch", "with --start, keep polling until the probe stops or Enter is pressed"),
+        arg_lit0(NULL, "raw", "with --watch, show plain hex instead of the parsed 802.15.4 decode"),
         arg_str0(NULL, "aa", "<hex>", "access address, 4 bytes (default 0x9b3af703, WazaBee's Zigbee-preamble sync value)"),
         arg_int0(NULL, "zbchan", "<11-26>", "802.15.4 channel to tune to (default 20, the ChameleonUltra default)"),
         arg_int0(NULL, "duration", "<1-300>", "seconds to probe; per channel with --sweep (default 60, max 300)"),
@@ -458,6 +736,7 @@ static int CmdBWMZbProbe(const char *Cmd) {
     bool status = arg_get_lit(ctx, 3);
     bool sweep = arg_get_lit(ctx, 4);
     bool watch = arg_get_lit(ctx, 5) || sweep;
+    bool raw = arg_get_lit(ctx, 6);
 
     // WazaBee's access address for the Zigbee preamble (eight repeated
     // 0000 symbols), MSK-encoded: Cayre/Galtier/Auriol/Nicomette/Marconato,
@@ -466,17 +745,17 @@ static int CmdBWMZbProbe(const char *Cmd) {
     uint32_t aa = 0x9b3af703;
     int aa_len = 0;
     uint8_t aa_buf[4];
-    CLIParamHexToBuf(arg_get_str(ctx, 6), aa_buf, sizeof(aa_buf), &aa_len);
+    CLIParamHexToBuf(arg_get_str(ctx, 7), aa_buf, sizeof(aa_buf), &aa_len);
     if (aa_len == 4) {
         aa = (aa_buf[0] << 24) | (aa_buf[1] << 16) | (aa_buf[2] << 8) | aa_buf[3];
     }
 
-    int zbchan = arg_get_int_def(ctx, 7, 20);
-    int duration = arg_get_int_def(ctx, 8, 60);
+    int zbchan = arg_get_int_def(ctx, 8, 20);
+    int duration = arg_get_int_def(ctx, 9, 60);
 
     int logfn_len = 0;
     char logfn[FILE_PATH_SIZE] = {0};
-    if (CLIParamStrToBuf(arg_get_str(ctx, 9), (uint8_t *)logfn, sizeof(logfn) - 1, &logfn_len)) {
+    if (CLIParamStrToBuf(arg_get_str(ctx, 10), (uint8_t *)logfn, sizeof(logfn) - 1, &logfn_len)) {
         CLIParserFree(ctx);
         return PM3_ESOFT;
     }
@@ -511,7 +790,7 @@ static int CmdBWMZbProbe(const char *Cmd) {
                 PrintAndLogEx(INFO, "sweep aborted");
                 break;
             }
-            int rc = bwm_zbprobe_run_watch(g_zb_sweep_channels[i], aa, duration_s, true, logf);
+            int rc = bwm_zbprobe_run_watch(g_zb_sweep_channels[i], aa, duration_s, true, raw, logf);
             if (rc != PM3_SUCCESS) {
                 if (logf) {
                     fclose(logf);
@@ -526,7 +805,7 @@ static int CmdBWMZbProbe(const char *Cmd) {
     }
 
     if (start) {
-        int rc = bwm_zbprobe_run_watch(zbchan, aa, duration_s, watch, logf);
+        int rc = bwm_zbprobe_run_watch(zbchan, aa, duration_s, watch, raw, logf);
         if (logf) {
             fclose(logf);
         }
@@ -563,7 +842,7 @@ static int CmdBWMZbProbe(const char *Cmd) {
 // rxbuf_snapshot changes; every poll is still logged to logf (if given),
 // so a quiet run still leaves a complete timestamped record to correlate
 // against other captures. Prints a one-line summary at the end.
-static int bwm_zbprobe_run_watch(int zbchan, uint32_t aa, uint16_t duration_s, bool do_watch, FILE *logf) {
+static int bwm_zbprobe_run_watch(int zbchan, uint32_t aa, uint16_t duration_s, bool do_watch, bool raw, FILE *logf) {
     int ble_chan = zb_channel_to_ble_channel((uint8_t)zbchan);
     if (ble_chan < 0) {
         PrintAndLogEx(FAILED, "802.15.4 channel %d has no exact BLE channel match - use one of 12,14,16,18,20,22,24,26", zbchan);
@@ -626,8 +905,14 @@ static int bwm_zbprobe_run_watch(int zbchan, uint32_t aa, uint16_t duration_s, b
                 longest_static_streak = static_streak;
             }
             static_streak = 0;
-            PrintAndLogEx(INFO, "[%u] rxbuf changed:", regs.poll_count);
-            print_hex_break(regs.rxbuf_snapshot, sizeof(regs.rxbuf_snapshot), 16);
+            if (raw) {
+                PrintAndLogEx(INFO, "[%u] rxbuf changed:", regs.poll_count);
+                print_hex_break(regs.rxbuf_snapshot, sizeof(regs.rxbuf_snapshot), 16);
+            } else {
+                char desc[256];
+                bwm_zb_describe_frame(regs.rxbuf_snapshot, sizeof(regs.rxbuf_snapshot), desc, sizeof(desc));
+                PrintAndLogEx(INFO, "[%u] ch%d %s", regs.poll_count, zbchan, desc);
+            }
         } else {
             static_streak++;
         }
