@@ -388,6 +388,201 @@ static int CmdBWMWifi(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+static int bwm_zbprobe_print_one(bool brief);
+
+// Only every other 802.15.4 channel's center frequency falls on BLE's 2MHz
+// grid (2402 + 2*k MHz). Returns the BLE channel index 0-39, or -1 if
+// zb_channel (11-26) has no exact match.
+static int zb_channel_to_ble_channel(uint8_t zb_channel) {
+    if (zb_channel < 11 || zb_channel > 26) {
+        return -1;
+    }
+    int zb_freq = 2405 + 5 * (zb_channel - 11);
+    int offset = zb_freq - 2402;
+    if (offset < 0 || offset > 78 || (offset % 2) != 0) {
+        return -1;
+    }
+    return offset / 2;
+}
+
+// EXPERIMENTAL. See bwm_zbprobe.h / Proxmark5_BWM_esp32's app_zb_probe component.
+// Drives the BWM's raw BLE PHY registers to test 802.15.4/Zigbee receive
+// feasibility; does not decode frames yet, only reports raw register state
+// and a candidate RX buffer read.
+static int CmdBWMZbProbe(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw bwm zbprobe",
+                  "EXPERIMENTAL. Test whether the BWM's ESP32-C2 BLE controller can be\n"
+                  "driven into a raw 802.15.4-style receive (2M GFSK, custom access\n"
+                  "address, whitening off). Does NOT decode Zigbee frames yet - this\n"
+                  "only reports whether the chip survives, its PHY registers, and a\n"
+                  "candidate RX buffer read. Takes the BWM's BLE controller away from\n"
+                  "BLE SPP while running; use the BWM over USB/UART, not BLE, while\n"
+                  "testing this.\n"
+                  "--zbchan is a real 802.15.4 channel number (11-26) - the frequency is\n"
+                  "set exactly via BLE's own public channel plan, no guesswork, but only\n"
+                  "every other 802.15.4 channel lines up with a BLE channel: 12, 14, 16,\n"
+                  "18, 20, 22, 24, 26.",
+                  "hw bwm zbprobe --start --zbchan 20                    --> probe ch 20 (2450MHz) for 60s\n"
+                  "hw bwm zbprobe --start --zbchan 20 --duration 300 --watch --> probe + live snapshots for 5min\n"
+                  "hw bwm zbprobe --status                               --> one register snapshot\n"
+                  "hw bwm zbprobe --stop                                 --> release the BLE controller");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0(NULL, "start", "start the probe"),
+        arg_lit0(NULL, "stop", "stop the probe, release the BLE controller"),
+        arg_lit0(NULL, "status", "one register snapshot"),
+        arg_lit0(NULL, "watch", "with --start, keep polling and printing snapshots until the probe stops or Enter is pressed"),
+        arg_str0(NULL, "aa", "<hex>", "access address, 4 bytes (default 0x9b3af703, WazaBee's Zigbee-preamble sync value)"),
+        arg_int0(NULL, "zbchan", "<11-26>", "802.15.4 channel to tune to (default 20, the ChameleonUltra default)"),
+        arg_int0(NULL, "duration", "<1-300>", "seconds to keep probing (default 60, max 300)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool start = arg_get_lit(ctx, 1);
+    bool stop = arg_get_lit(ctx, 2);
+    bool status = arg_get_lit(ctx, 3);
+    bool watch = arg_get_lit(ctx, 4);
+
+    // WazaBee's access address for the Zigbee preamble (eight repeated
+    // 0000 symbols), MSK-encoded: Cayre/Galtier/Auriol/Nicomette/Marconato,
+    // "WazaBee", SSTIC 2020. Confirmed on real BLE radios (nRF52832,
+    // CC1352-R1); not yet tried on this chip.
+    uint32_t aa = 0x9b3af703;
+    int aa_len = 0;
+    uint8_t aa_buf[4];
+    CLIParamHexToBuf(arg_get_str(ctx, 5), aa_buf, sizeof(aa_buf), &aa_len);
+    if (aa_len == 4) {
+        aa = (aa_buf[0] << 24) | (aa_buf[1] << 16) | (aa_buf[2] << 8) | aa_buf[3];
+    }
+
+    int zbchan = arg_get_int_def(ctx, 6, 20);
+    int duration = arg_get_int_def(ctx, 7, 60);
+    CLIParserFree(ctx);
+
+    if ((start + stop + status) != 1) {
+        PrintAndLogEx(WARNING, "specify exactly one of " _YELLOW_("--start") ", " _YELLOW_("--stop") " or " _YELLOW_("--status"));
+        return PM3_EINVARG;
+    }
+
+    uint8_t action;
+    uint8_t data[8] = {0};
+    int dlen;
+    uint16_t duration_s = 0;
+    if (start) {
+        int ble_chan = zb_channel_to_ble_channel((uint8_t)zbchan);
+        if (ble_chan < 0) {
+            PrintAndLogEx(FAILED, "802.15.4 channel %d has no exact BLE channel match - use one of 12,14,16,18,20,22,24,26", zbchan);
+            return PM3_EINVARG;
+        }
+        if (duration < 1 || duration > 300) {
+            PrintAndLogEx(WARNING, "duration must be 1..300 seconds, got %d", duration);
+            return PM3_EINVARG;
+        }
+        duration_s = (uint16_t)duration;
+        action = BWM_ZBPROBE_ACTION_START;
+        data[0] = action;
+        memcpy(data + 1, &aa, 4);
+        data[5] = (uint8_t)ble_chan;
+        memcpy(data + 6, &duration_s, 2);
+        dlen = 8;
+        PrintAndLogEx(WARNING, "EXPERIMENTAL - this takes the BLE controller away from BLE SPP");
+        PrintAndLogEx(INFO, "802.15.4 ch %d -> BLE ch %d (%d MHz), %us", zbchan, ble_chan, 2402 + 2 * ble_chan, duration_s);
+    } else if (stop) {
+        action = BWM_ZBPROBE_ACTION_STOP;
+        data[0] = action;
+        dlen = 1;
+    } else {
+        action = BWM_ZBPROBE_ACTION_GET_REGS;
+        data[0] = action;
+        dlen = 1;
+    }
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_PM5_BWM_ZBPROBE, data, dlen);
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_PM5_BWM_ZBPROBE, &resp, 3000) == false) {
+        PrintAndLogEx(WARNING, "command timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "zbprobe command failed (%d)", resp.status);
+        return resp.status;
+    }
+
+    if (start) {
+        PrintAndLogEx(SUCCESS, "zbprobe started");
+        if (!watch) {
+            return PM3_SUCCESS;
+        }
+        PrintAndLogEx(INFO, "watching, press " _YELLOW_("Enter") " to stop early...");
+        for (uint16_t elapsed = 0; elapsed < duration_s; elapsed++) {
+            if (kbd_enter_pressed()) {
+                break;
+            }
+            msleep(1000);
+            bwm_zbprobe_print_one(true);
+        }
+        return PM3_SUCCESS;
+    } else if (stop) {
+        PrintAndLogEx(SUCCESS, "zbprobe stopped, BLE controller released");
+        return PM3_SUCCESS;
+    }
+    return bwm_zbprobe_print_one(false);
+}
+
+// action = GET_REGS; prints one snapshot. brief=true for the --watch loop
+// (one compact line), false for a one-shot `--status` (full field dump).
+static int bwm_zbprobe_print_one(bool brief) {
+    uint8_t data[1] = { BWM_ZBPROBE_ACTION_GET_REGS };
+    clearCommandBuffer();
+    SendCommandNG(CMD_PM5_BWM_ZBPROBE, data, sizeof(data));
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_PM5_BWM_ZBPROBE, &resp, 3000) == false) {
+        PrintAndLogEx(WARNING, "command timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "zbprobe command failed (%d)", resp.status);
+        return resp.status;
+    }
+    bwm_zbprobe_regs_t regs;
+    if (resp.length != sizeof(regs)) {
+        PrintAndLogEx(FAILED, "unexpected response length %u (expected %u) - BWM firmware mismatch?", resp.length, (uint32_t)sizeof(regs));
+        return PM3_EFAILED;
+    }
+    memcpy(&regs, resp.data.asBytes, sizeof(regs));
+
+    if (brief) {
+        PrintAndLogEx(INFO, "[%u] running=%s rxbuf=0x%08x%s", regs.poll_count,
+                      regs.running ? _GREEN_("y") : _RED_("n"), regs.rxbuf_ptr,
+                      regs.rxbuf_in_dram ? "" : " (outside DRAM)");
+        if (regs.rxbuf_in_dram) {
+            print_hex_break(regs.rxbuf_snapshot, sizeof(regs.rxbuf_snapshot), 16);
+        }
+        if (!regs.running) {
+            PrintAndLogEx(INFO, "probe is no longer running (duration elapsed or stopped)");
+        }
+        return PM3_SUCCESS;
+    }
+
+    PrintAndLogEx(INFO, "running..... %s", regs.running ? _GREEN_("yes") : _RED_("no"));
+    PrintAndLogEx(INFO, "poll count.. %u", regs.poll_count);
+    PrintAndLogEx(INFO, "freq reg.... 0x%08x", regs.reg_freq);
+    PrintAndLogEx(INFO, "mode a/b.... 0x%08x / 0x%08x", regs.reg_mode_a, regs.reg_mode_b);
+    PrintAndLogEx(INFO, "whiten reg.. 0x%08x", regs.reg_whiten);
+    PrintAndLogEx(INFO, "access addr. 0x%08x%08x", regs.reg_aa_hi, regs.reg_aa_lo);
+    PrintAndLogEx(INFO, "rxbuf ptr... 0x%08x (aux 0x%08x)%s", regs.rxbuf_ptr, regs.rxbuf_aux,
+                  regs.rxbuf_in_dram ? "" : _RED_(" - outside DRAM, not read"));
+    if (regs.rxbuf_in_dram) {
+        PrintAndLogEx(INFO, "rxbuf bytes (unconfirmed - may be stale, not a captured frame):");
+        print_hex_break(regs.rxbuf_snapshot, sizeof(regs.rxbuf_snapshot), 16);
+    }
+    return PM3_SUCCESS;
+}
+
 static int CmdBwmCharge(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hw bwm charge",
@@ -1359,6 +1554,7 @@ static command_t BwmCommandTable[] = {
     {"vchg",     CmdBwmVchg,    IfBwm, "Set charger charge-voltage target (default 4200 mV)"},
     {"wifi",     CmdBWMWifi,    IfBwm, "Bring up WiFi (STA + TCP server) for a tcp: connection"},
     {"wifipower", CmdBwmWifiPower, IfBwm, "WiFi fully off, or the modem power-save type (none/min/max)"},
+    {"zbprobe",  CmdBWMZbProbe, IfBwm, "EXPERIMENTAL: probe raw BLE PHY for 802.15.4/Zigbee receive feasibility"},
     {NULL, NULL, NULL, NULL}
 };
 

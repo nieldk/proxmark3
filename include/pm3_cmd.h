@@ -1075,6 +1075,32 @@ typedef struct {
 #define BWM_WIFI_ACTION_START  0x00   // join AP + start TCP server
 #define BWM_WIFI_ACTION_STOP   0x01   // tear down, back to BLE-only
 #define BWM_WIFI_ACTION_STATUS 0x02   // query current connection state + IP
+// EXPERIMENTAL. PM5, drive the BWM's raw ESP32-C2 BLE PHY primitives (2M GFSK,
+// custom access address, whitening off) to test 802.15.4/Zigbee receive
+// feasibility. Takes the BWM's BLE controller away from BLE SPP while running;
+// the BWM link to this PM5 must be over USB/UART, not BLE, while this is active.
+// Wire format and even the approach may change - see `hw bwm zbprobe -h`.
+// req: [action:u8][access_addr:u32 LE][ble_channel:u8][duration_s:u16 LE] (last three only for START)
+// resp (START/STOP): [status:u8] 0=ok. resp (GET_REGS): bwm_zbprobe_regs_t.
+#define CMD_PM5_BWM_ZBPROBE   0x0186
+#define BWM_ZBPROBE_ACTION_START    0x00
+#define BWM_ZBPROBE_ACTION_STOP     0x01
+#define BWM_ZBPROBE_ACTION_GET_REGS 0x02
+#define BWM_ZBPROBE_RXBUF_SNAPSHOT_LEN 32
+typedef struct {
+    uint32_t reg_freq;     // candidate channel/frequency register, units unverified
+    uint32_t reg_mode_a;
+    uint32_t reg_mode_b;
+    uint32_t reg_whiten;   // bit 25 = whitening enable
+    uint32_t reg_aa_lo;
+    uint32_t reg_aa_hi;
+    uint32_t poll_count;
+    uint32_t rxbuf_ptr;    // candidate RX buffer address (r_ble_phy_global_rxbuf_get, 1st out-param)
+    uint32_t rxbuf_aux;    // 2nd out-param of the same call; meaning not confirmed
+    uint8_t  rxbuf_in_dram; // 1 if rxbuf_ptr fell inside chip DRAM and rxbuf_snapshot was read
+    uint8_t  rxbuf_snapshot[BWM_ZBPROBE_RXBUF_SNAPSHOT_LEN]; // bytes at rxbuf_ptr, valid only if rxbuf_in_dram
+    uint8_t  running;
+} PACKED bwm_zbprobe_regs_t;
 // For low-frequency tags
 #define CMD_LF_TI_READ 0x0202
 #define CMD_LF_TI_WRITE 0x0203

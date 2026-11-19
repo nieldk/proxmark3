@@ -188,7 +188,7 @@ else ()
 endif ()
 
 if ("${APP_CFLAGS}" MATCHES "WITH_BWM_FORWARD")
-    set(SRC_BWM bwm_uart_at32.c bwm_forward.c bwm_wifi.c bwm_frame.c)
+    set(SRC_BWM bwm_uart_at32.c bwm_forward.c bwm_wifi.c bwm_zbprobe.c bwm_frame.c)
 else ()
     set(SRC_BWM)
 endif ()

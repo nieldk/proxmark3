@@ -26,6 +26,7 @@
 #include "bwm_uart_at32.h"
 #include "bwm_forward.h"   // bwm_fwd_negotiate_baud()
 #include "bwm_wifi.h"
+#include "bwm_zbprobe.h"
 #endif
 #ifdef WITH_CEP
 #include "pm5_cep.h"
@@ -4465,6 +4466,33 @@ static void PacketReceived(PacketCommandNG *packet) {
             }
 #else
             reply_ng(CMD_PM5_BWM_WIFI, PM3_ENOTIMPL, NULL, 0);
+#endif
+            break;
+        }
+        case CMD_PM5_BWM_ZBPROBE: {
+            // EXPERIMENTAL, see bwm_zbprobe.h.
+#if defined(WITH_BWM_FORWARD)
+            uint8_t action = packet->data.asBytes[0];
+            if (action == BWM_ZBPROBE_ACTION_START) {
+                uint32_t aa;
+                uint16_t duration_s;
+                uint8_t ble_channel = packet->data.asBytes[5];
+                memcpy(&aa,         packet->data.asBytes + 1, 4);
+                memcpy(&duration_s, packet->data.asBytes + 6, 2);
+                int res = bwm_zbprobe_start(aa, ble_channel, duration_s);
+                uint8_t status = (res == PM3_SUCCESS) ? 0 : 1;
+                reply_ng(CMD_PM5_BWM_ZBPROBE, res, &status, sizeof(status));
+            } else if (action == BWM_ZBPROBE_ACTION_STOP) {
+                int res = bwm_zbprobe_stop();
+                uint8_t status = (res == PM3_SUCCESS) ? 0 : 1;
+                reply_ng(CMD_PM5_BWM_ZBPROBE, res, &status, sizeof(status));
+            } else {
+                bwm_zbprobe_regs_t regs;
+                int res = bwm_zbprobe_get_regs(&regs);
+                reply_ng(CMD_PM5_BWM_ZBPROBE, res, (uint8_t *)&regs, sizeof(regs));
+            }
+#else
+            reply_ng(CMD_PM5_BWM_ZBPROBE, PM3_ENOTIMPL, NULL, 0);
 #endif
             break;
         }
